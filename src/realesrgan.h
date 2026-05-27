@@ -3,6 +3,16 @@
 #ifndef REALESRGAN_H
 #define REALESRGAN_H
 
+#if defined(_WIN32)
+  #if defined(REALESRGAN_BUILDING_DLL)
+    #define REALESRGAN_API __declspec(dllexport)
+  #else
+    #define REALESRGAN_API __declspec(dllimport)
+  #endif
+#else
+  #define REALESRGAN_API __attribute__((visibility("default")))
+#endif
+
 #include <string>
 
 // ncnn
@@ -10,7 +20,7 @@
 #include "gpu.h"
 #include "layer.h"
 
-class RealESRGAN
+class REALESRGAN_API RealESRGAN
 {
 public:
     RealESRGAN(int gpuid, bool tta_mode = false);
@@ -23,6 +33,16 @@ public:
 #endif
 
     int process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const;
+
+    // Plain-pointer wrapper: RGBA pixels in -> RGBA pixels out.
+    // outPixels must point to a buffer of outW * outH * 4 bytes.
+    // Returns 0 on success, non-zero on error.
+    int processPixels(const unsigned char *inPixels,  int inW,  int inH,
+                      unsigned char       *outPixels, int outW, int outH) const;
+
+    // Returns the recommended tilesize based on available GPU VRAM.
+    // Must be called after construction (Vulkan is already initialised by then).
+    int autoTilesize() const;
 
 public:
     // realesrgan parameters

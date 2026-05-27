@@ -2,7 +2,25 @@ cmake_minimum_required(VERSION 3.10)
 
 cmake_policy(SET CMP0091 NEW)
 set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
+if(POLICY CMP0071)
+    cmake_policy(SET CMP0071 NEW)
+endif()
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+# Disable Qt AUTOMOC/AUTOUIC/AUTORCC globally in this subdirectory to prevent 
+# CMake from adding empty/dummy autogen sources that cause link errors.
+set(CMAKE_AUTOMOC OFF)
+set(CMAKE_AUTOUIC OFF)
+set(CMAKE_AUTORCC OFF)
+
+if(MSVC)
+    # Suppress verbose third-party conversion warnings for a clean build output:
+    # C4244: 'double' to 'float' conversion
+    # C4267: 'size_t' to 'int' conversion
+    # C4305: 'double' to 'float' truncation
+    # C4251: dll-interface warning for private ncnn members (safe to suppress)
+    add_compile_options(/wd4244 /wd4267 /wd4305 /wd4251)
+endif()
 
 # -------------- Support C++17 for using filesystem  ------------------#
 # https://cmake.org/cmake/help/latest/prop_tgt/CXX_STANDARD.html
@@ -14,14 +32,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++lastest")
 # -------------- End  ------------------#
 
-# set(CMAKE_EXE_LINKER_FLAGS "-static-libgcc -static-libstdc++")
-
 project(upscayl-bin)
 
 set(CMAKE_BUILD_TYPE Release)
 
 option(USE_SYSTEM_NCNN "build with system libncnn" OFF)
 option(USE_SYSTEM_WEBP "build with system libwebp" OFF)
+option(BUILD_CLI "Build upscayl-bin CLI executable" OFF)
 option(USE_STATIC_MOLTENVK "link moltenvk static library" OFF)
 
 find_package(Threads)
@@ -231,38 +248,40 @@ if(NOT USE_SYSTEM_NCNN)
     add_subdirectory(ncnn)
 endif()
 
-if(USE_SYSTEM_WEBP)
-    set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}")
-    find_package(WebP)
-    if(NOT TARGET webp)
-        message(WARNING "webp target not found! USE_SYSTEM_WEBP will be turned off.")
-        set(USE_SYSTEM_WEBP OFF)
-    endif()
-endif()
-
-if(NOT USE_SYSTEM_WEBP)
-    # build libwebp library
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libwebp/CMakeLists.txt")
-        message(FATAL_ERROR "The submodules were not downloaded! Please update submodules with \"git submodule update --init --recursive\" and try again.")
+if(BUILD_CLI)
+    if(USE_SYSTEM_WEBP)
+        set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}")
+        find_package(WebP)
+        if(NOT TARGET webp)
+            message(WARNING "webp target not found! USE_SYSTEM_WEBP will be turned off.")
+            set(USE_SYSTEM_WEBP OFF)
+        endif()
     endif()
 
-    option(WEBP_ENABLE_SIMD "" ON)
-    option(WEBP_BUILD_ANIM_UTILS "" OFF)
-    option(WEBP_BUILD_CWEBP "" OFF)
-    option(WEBP_BUILD_DWEBP "" OFF)
-    option(WEBP_BUILD_GIF2WEBP "" OFF)
-    option(WEBP_BUILD_IMG2WEBP "" OFF)
-    option(WEBP_BUILD_VWEBP "" OFF)
-    option(WEBP_BUILD_WEBPINFO "" OFF)
-    option(WEBP_BUILD_WEBPMUX "" OFF)
-    option(WEBP_BUILD_EXTRAS "" OFF)
-    option(WEBP_BUILD_WEBP_JS "" OFF)
-    option(WEBP_NEAR_LOSSLESS "" OFF)
-    option(WEBP_ENABLE_SWAP_16BIT_CSP "" OFF)
+    if(NOT USE_SYSTEM_WEBP)
+        # build libwebp library
+        if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libwebp/CMakeLists.txt")
+            message(FATAL_ERROR "The submodules were not downloaded! Please update submodules with \"git submodule update --init --recursive\" and try again.")
+        endif()
 
-    add_subdirectory(libwebp)
+        option(WEBP_ENABLE_SIMD "" ON)
+        option(WEBP_BUILD_ANIM_UTILS "" OFF)
+        option(WEBP_BUILD_CWEBP "" OFF)
+        option(WEBP_BUILD_DWEBP "" OFF)
+        option(WEBP_BUILD_GIF2WEBP "" OFF)
+        option(WEBP_BUILD_IMG2WEBP "" OFF)
+        option(WEBP_BUILD_VWEBP "" OFF)
+        option(WEBP_BUILD_WEBPINFO "" OFF)
+        option(WEBP_BUILD_WEBPMUX "" OFF)
+        option(WEBP_BUILD_EXTRAS "" OFF)
+        option(WEBP_BUILD_WEBP_JS "" OFF)
+        option(WEBP_NEAR_LOSSLESS "" OFF)
+        option(WEBP_ENABLE_SWAP_16BIT_CSP "" OFF)
 
-    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/libwebp/src)
+        add_subdirectory(libwebp)
+
+        include_directories(${CMAKE_CURRENT_SOURCE_DIR}/libwebp/src)
+    endif()
 endif()
 
 # look for vulkan compute shader and compile
@@ -275,37 +294,57 @@ compile_shader(realesrgan_postproc_tta.comp)
 
 add_custom_target(generate-spirv DEPENDS ${SHADER_SPV_HEX_FILES})
 
-add_executable(upscayl-bin main.cpp realesrgan.cpp)
+if(BUILD_CLI)
+    add_executable(upscayl-bin main.cpp realesrgan.cpp)
 
-add_dependencies(upscayl-bin generate-spirv)
+    add_dependencies(upscayl-bin generate-spirv)
 
-set(REALESRGAN_LINK_LIBRARIES ncnn webp ${Vulkan_LIBRARY})
+    set(REALESRGAN_LINK_LIBRARIES ncnn webp ${Vulkan_LIBRARY})
 
-if(USE_STATIC_MOLTENVK)
-    find_library(CoreFoundation NAMES CoreFoundation)
-    find_library(Foundation NAMES Foundation)
-    find_library(Metal NAMES Metal)
-    find_library(QuartzCore NAMES QuartzCore)
-    find_library(CoreGraphics NAMES CoreGraphics)
-    find_library(Cocoa NAMES Cocoa)
-    find_library(IOKit NAMES IOKit)
-    find_library(IOSurface NAMES IOSurface)
+    if(USE_STATIC_MOLTENVK)
+        find_library(CoreFoundation NAMES CoreFoundation)
+        find_library(Foundation NAMES Foundation)
+        find_library(Metal NAMES Metal)
+        find_library(QuartzCore NAMES QuartzCore)
+        find_library(CoreGraphics NAMES CoreGraphics)
+        find_library(Cocoa NAMES Cocoa)
+        find_library(IOKit NAMES IOKit)
+        find_library(IOSurface NAMES IOSurface)
 
-    list(APPEND REALESRGAN_LINK_LIBRARIES
-        ${Metal}
-        ${QuartzCore}
-        ${CoreGraphics}
-        ${Cocoa}
-        ${IOKit}
-        ${IOSurface}
-        ${Foundation}
-        ${CoreFoundation}
-    )
+        list(APPEND REALESRGAN_LINK_LIBRARIES
+            ${Metal}
+            ${QuartzCore}
+            ${CoreGraphics}
+            ${Cocoa}
+            ${IOKit}
+            ${IOSurface}
+            ${Foundation}
+            ${CoreFoundation}
+        )
+    endif()
+
+    if(OPENMP_FOUND)
+        list(APPEND REALESRGAN_LINK_LIBRARIES ${OpenMP_CXX_LIBRARIES})
+    endif()
+
+    target_link_libraries(upscayl-bin ${REALESRGAN_LINK_LIBRARIES} -static-libstdc++)
 endif()
 
+# --- Custom shared library target for dynamic linking ---
+add_library(upscayl-ncnn SHARED realesrgan.cpp)
+add_dependencies(upscayl-ncnn generate-spirv)
+set_target_properties(upscayl-ncnn PROPERTIES 
+    AUTOMOC OFF
+    AUTOUIC OFF
+    AUTORCC OFF
+    INTERPROCEDURAL_OPTIMIZATION OFF
+)
+target_compile_definitions(upscayl-ncnn PRIVATE REALESRGAN_BUILDING_DLL)
+target_link_libraries(upscayl-ncnn PRIVATE ncnn ${Vulkan_LIBRARY})
+target_include_directories(upscayl-ncnn PUBLIC 
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}
+    $<TARGET_PROPERTY:ncnn,INTERFACE_INCLUDE_DIRECTORIES>)
 if(OPENMP_FOUND)
-    list(APPEND REALESRGAN_LINK_LIBRARIES ${OpenMP_CXX_LIBRARIES})
+    target_link_libraries(upscayl-ncnn PRIVATE ${OpenMP_CXX_LIBRARIES})
 endif()
-
-target_link_libraries(upscayl-bin ${REALESRGAN_LINK_LIBRARIES} -static-libstdc++)
-
