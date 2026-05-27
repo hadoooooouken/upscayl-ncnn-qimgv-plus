@@ -20,6 +20,11 @@ if(MSVC)
     # C4305: 'double' to 'float' truncation
     # C4251: dll-interface warning for private ncnn members (safe to suppress)
     add_compile_options(/wd4244 /wd4267 /wd4305 /wd4251)
+
+    # Remove /GR from CMAKE_CXX_FLAGS to avoid duplicate RTTI flags.
+    # This prevents both the "overriding /GR" warning and the duplicate "/GR--" -> "/G-" warning in glslang.
+    string(REPLACE "/GR" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    add_compile_options(/GR-)
 endif()
 
 # -------------- Support C++17 for using filesystem  ------------------#
