@@ -1,0 +1,43 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 547be913..885f5a9d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -29,7 +29,7 @@ if(APPLE OR IOS)
+ endif()
+ message(STATUS "NCNN_VERSION_STRING = ${NCNN_VERSION_STRING}")
+ 
+-cmake_minimum_required(VERSION 2.8.12)
++cmake_minimum_required(VERSION 3.10)
+ 
+ if(NOT CMAKE_BUILD_TYPE)
+     set(CMAKE_BUILD_TYPE release CACHE STRING "Choose the type of build" FORCE)
+diff --git a/glslang b/glslang
+--- a/glslang
++++ b/glslang
+@@ -1 +1 @@
+-Subproject commit 4afd69177258d0636f78d2c4efb823ab6382a187
++Subproject commit 4afd69177258d0636f78d2c4efb823ab6382a187-dirty
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 5cd3112f..3ce246c7 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -315,11 +315,17 @@ else()
+ endif()
+ 
+ if(NCNN_DISABLE_RTTI)
+-    target_compile_options(ncnn PUBLIC -fno-rtti)
++    if(MSVC)
++        target_compile_options(ncnn PUBLIC /GR-)
++    else()
++        target_compile_options(ncnn PUBLIC -fno-rtti)
++    endif()
+ endif()
+ 
+ if(NCNN_DISABLE_EXCEPTION)
+-    target_compile_options(ncnn PUBLIC -fno-exceptions)
++    if(NOT MSVC)
++        target_compile_options(ncnn PUBLIC -fno-exceptions)
++    endif()
+ endif()
+ 
+ if(NCNN_TARGET_ARCH STREQUAL "x86")
