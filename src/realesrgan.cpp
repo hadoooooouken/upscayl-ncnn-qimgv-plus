@@ -84,7 +84,7 @@ RealESRGAN::RealESRGAN(int gpuid, bool _tta_mode) {
 
   net.opt.use_vulkan_compute = true;
   net.opt.use_fp16_packed = true;
-  net.opt.use_fp16_storage = true;
+  net.opt.use_fp16_storage = false;
   net.opt.use_fp16_arithmetic = false;
   net.opt.use_int8_storage = false;
   net.opt.use_int8_arithmetic = false;
