@@ -1,6 +1,7 @@
 [submodule "src/ncnn"]
 	path = src/ncnn
 	url = https://github.com/Tencent/ncnn.git
+	ignore = dirty
 [submodule "src/libwebp"]
 	path = src/libwebp
 	url = https://github.com/webmproject/libwebp.git
