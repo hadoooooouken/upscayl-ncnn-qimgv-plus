@@ -14,6 +14,7 @@
 #endif
 
 #include <string>
+#include <atomic>
 
 // ncnn
 #include "net.h"
@@ -32,13 +33,14 @@ public:
     int load(const std::string &parampath, const std::string &modelpath);
 #endif
 
-    int process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const;
+    int process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std::atomic<bool> *abortFlag = nullptr) const;
 
     // Plain-pointer wrapper: RGBA pixels in -> RGBA pixels out.
     // outPixels must point to a buffer of outW * outH * 4 bytes.
     // Returns 0 on success, non-zero on error.
     int processPixels(const unsigned char *inPixels,  int inW,  int inH,
-                      unsigned char       *outPixels, int outW, int outH) const;
+                      unsigned char       *outPixels, int outW, int outH,
+                      const std::atomic<bool> *abortFlag = nullptr) const;
 
     // Returns the recommended tilesize based on available GPU VRAM.
     // Must be called after construction (Vulkan is already initialised by then).

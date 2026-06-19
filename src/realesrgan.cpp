@@ -299,7 +299,7 @@ int RealESRGAN::load(const std::string &parampath, const std::string &modelpath)
   return 0;
 }
 
-int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const {
+int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std::atomic<bool> *abortFlag) const {
   const unsigned char *pixeldata = (const unsigned char *)inimage.data;
   const int w = inimage.w;
   const int h = inimage.h;
@@ -324,8 +324,14 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const {
 
   const size_t in_out_tile_elemsize = opt.use_fp16_storage ? 2u : 4u;
 
+  bool aborted = false;
+
   // #pragma omp parallel for num_threads(2)
   for (int yi = 0; yi < ytiles; yi++) {
+    if (abortFlag && abortFlag->load(std::memory_order_relaxed)) {
+      aborted = true;
+      break;
+    }
     const int tile_h_nopad =
         std::min((yi + 1) * TILE_SIZE_Y, h) - yi * TILE_SIZE_Y;
 
@@ -388,6 +394,10 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const {
     }
 
     for (int xi = 0; xi < xtiles; xi++) {
+      if (abortFlag && abortFlag->load(std::memory_order_relaxed)) {
+        aborted = true;
+        break;
+      }
       const int tile_w_nopad =
           std::min((xi + 1) * TILE_SIZE_X, w) - xi * TILE_SIZE_X;
 
@@ -661,6 +671,10 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const {
               (float)(yi * xtiles + xi) / (ytiles * xtiles) * 100);
     }
 
+    if (aborted) {
+      break;
+    }
+
     // download
     {
       ncnn::Mat out;
@@ -706,16 +720,19 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage) const {
   net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
   net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
 
+  if (aborted) {
+    return -1;
+  }
   return 0;
 }
 
 int RealESRGAN::processPixels(const unsigned char *inPixels, int inW, int inH,
                               unsigned char *outPixels, int outW,
-                              int outH) const {
+                              int outH, const std::atomic<bool> *abortFlag) const {
   ncnn::Mat inMat(inW, inH, (void *)inPixels, (size_t)4u, 4);
   ncnn::Mat outMat(outW, outH, (size_t)4u, 4);
 
-  int ret = process(inMat, outMat);
+  int ret = process(inMat, outMat, abortFlag);
   if (ret != 0)
     return ret;
 
