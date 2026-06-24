@@ -5,7 +5,7 @@ set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
 if(POLICY CMP0071)
     cmake_policy(SET CMP0071 NEW)
 endif()
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 # Disable Qt AUTOMOC/AUTOUIC/AUTORCC globally in this subdirectory to prevent 
 # CMake from adding empty/dummy autogen sources that cause link errors.
