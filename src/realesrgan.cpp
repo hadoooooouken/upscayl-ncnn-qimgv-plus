@@ -2,6 +2,8 @@
 #include <string.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <memory>
 #include <sstream>
 #include <vector>
 
@@ -12,6 +14,11 @@
 #endif
 #include <windows.h>
 #endif
+
+namespace {
+constexpr int kModelLoadFailure = -1;
+using FileHandle = std::unique_ptr<FILE, decltype(&fclose)>;
+}
 
 static const uint32_t realesrgan_preproc_spv_data[] = {
 #include "realesrgan_preproc.spv.hex.h"
@@ -164,28 +171,39 @@ int RealESRGAN::load(const std::string &parampath, const std::string &modelpath)
 {
 #if _WIN32
   {
-    FILE *fp = _wfopen(parampath.c_str(), L"rb");
+    FileHandle fp(_wfopen(parampath.c_str(), L"rb"), &fclose);
     if (!fp) {
       fwprintf(stderr, L"🚨 Error: Failed to open %ls\n", parampath.c_str());
+      return kModelLoadFailure;
     }
 
-    net.load_param(fp);
-
-    fclose(fp);
+    const int result = net.load_param(fp.get());
+    if (result != 0) {
+      fwprintf(stderr, L"🚨 Error: Failed to load %ls\n", parampath.c_str());
+      return result;
+    }
   }
   {
-    FILE *fp = _wfopen(modelpath.c_str(), L"rb");
+    FileHandle fp(_wfopen(modelpath.c_str(), L"rb"), &fclose);
     if (!fp) {
       fwprintf(stderr, L"🚨 Error: Failed to open %ls\n", modelpath.c_str());
+      return kModelLoadFailure;
     }
 
-    net.load_model(fp);
-
-    fclose(fp);
+    const int result = net.load_model(fp.get());
+    if (result != 0) {
+      fwprintf(stderr, L"🚨 Error: Failed to load %ls\n", modelpath.c_str());
+      return result;
+    }
   }
 #else
-  net.load_param(parampath.c_str());
-  net.load_model(modelpath.c_str());
+  const int paramResult = net.load_param(parampath.c_str());
+  if (paramResult != 0)
+    return paramResult;
+
+  const int modelResult = net.load_model(modelpath.c_str());
+  if (modelResult != 0)
+    return modelResult;
 #endif
 
   // initialize preprocess and postprocess pipeline
