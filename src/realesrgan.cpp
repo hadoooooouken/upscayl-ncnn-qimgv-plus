@@ -1,9 +1,11 @@
 #include "realesrgan.h"
-#include <string.h>
 
 #include <algorithm>
 #include <cstdio>
+#include <initializer_list>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <vector>
 
@@ -17,6 +19,71 @@
 
 namespace {
 constexpr int kModelLoadFailure = -1;
+constexpr int kInvalidProcessInputFailure = -2;
+constexpr int kAllocatorUnavailableFailure = -3;
+constexpr uint64_t kBytesPerMebibyte = 1024ULL * 1024ULL;
+constexpr uint64_t kLargeDeviceHeapThresholdBytes =
+    4000ULL * kBytesPerMebibyte;
+constexpr uint64_t kVeryHighDeviceBudgetBytes =
+    5000ULL * kBytesPerMebibyte;
+constexpr uint64_t kHighDeviceBudgetBytes = 3000ULL * kBytesPerMebibyte;
+constexpr uint64_t kMediumDeviceBudgetBytes = 1900ULL * kBytesPerMebibyte;
+constexpr uint64_t kLowDeviceBudgetBytes = 550ULL * kBytesPerMebibyte;
+constexpr uint64_t kVeryLowDeviceBudgetBytes = 190ULL * kBytesPerMebibyte;
+constexpr int kVeryHighBudgetTileSize = 512;
+constexpr int kHighBudgetTileSize = 400;
+constexpr int kMediumBudgetTileSize = 200;
+constexpr int kLowBudgetTileSize = 100;
+constexpr int kVeryLowBudgetTileSize = 64;
+constexpr int kMinimumBudgetTileSize = 32;
+constexpr int kFallbackTileSize = 100;
+constexpr int kIntegratedGpuType = 1;
+constexpr int kCpuDeviceType = 3;
+constexpr uint64_t kRgbaChannelCount = 4;
+constexpr uint64_t kRgbChannelCount = 3;
+constexpr uint64_t kPackedRgbaBytesPerPixel = 4;
+constexpr uint64_t kFp16BytesPerChannel = sizeof(uint16_t);
+constexpr uint64_t kFp32BytesPerChannel = sizeof(float);
+constexpr uint64_t kTtaTransformCount = 8;
+constexpr uint64_t kSingleTransformCount = 1;
+constexpr uint64_t kPaddingSideCount = 2;
+constexpr uint64_t kLargeHeapReserveDenominator = 10;
+constexpr uint64_t kLargeHeapReservedParts = 3;
+constexpr uint64_t kSmallHeapBudgetDivisor = 2;
+constexpr uint64_t kWorkspaceConcurrentFeatureMapCount = 4;
+constexpr uint64_t kWorkspaceFeatureChannelCount = 64;
+
+// Reserve four simultaneous 64-channel fp16 feature maps at the output-tile
+// resolution. Known input/output and staging buffers are added separately.
+constexpr uint64_t kNetworkWorkspaceBytesPerOutputPixel =
+    kWorkspaceConcurrentFeatureMapCount * kWorkspaceFeatureChannelCount *
+    kFp16BytesPerChannel;
+
+std::optional<uint64_t>
+checkedProduct(std::initializer_list<uint64_t> factors) {
+  uint64_t product = 1;
+  for (const uint64_t factor : factors) {
+    if (factor != 0 &&
+        product > (std::numeric_limits<uint64_t>::max)() / factor) {
+      return std::nullopt;
+    }
+    product *= factor;
+  }
+  return product;
+}
+
+std::optional<uint64_t>
+checkedSum(std::initializer_list<uint64_t> terms) {
+  uint64_t sum = 0;
+  for (const uint64_t term : terms) {
+    if (sum > (std::numeric_limits<uint64_t>::max)() - term) {
+      return std::nullopt;
+    }
+    sum += term;
+  }
+  return sum;
+}
+
 using FileHandle = std::unique_ptr<FILE, decltype(&fclose)>;
 }
 
@@ -137,29 +204,194 @@ RealESRGAN::~RealESRGAN() {
 }
 
 int RealESRGAN::autoTilesize() const {
-  // NOTE: heap_budget is measured at construction time, before the OpenGL
-  // viewport has fully allocated its VRAM share. At inference time both
-  // Vulkan (ncnn) and OpenGL (qimgv viewer) compete for the same VRAM pool.
-  // The neural-network intermediate feature maps can be 10-20x larger than
-  // the raw pixel buffers, so we apply a conservative safety margin.
-
-  int gpuid = ncnn::get_default_gpu_index();
-  if (gpuid >= 0 && gpuid < ncnn::get_gpu_count()) {
-    uint32_t heapBudget = ncnn::get_gpu_device(gpuid)->get_heap_budget();
-    if (heapBudget > 5000)
-      return 512; // 8 GB+
-    else if (heapBudget > 3000)
-      return 400; // 4-6 GB
-    else if (heapBudget > 1900)
-      return 200; // 2-4 GB
-    else if (heapBudget > 550)
-      return 100;
-    else if (heapBudget > 190)
-      return 64;
-    else
-      return 32;
+  const DeviceMemorySnapshot snapshot = getDeviceMemorySnapshot();
+  if (!snapshot.valid) {
+    return kFallbackTileSize;
   }
-  return 100; // fallback: no valid GPU index
+
+  const uint64_t availableBytes =
+      snapshot.usageKnown
+          ? snapshot.usageBytes < snapshot.budgetBytes
+                ? snapshot.budgetBytes - snapshot.usageBytes
+                : 0
+          : snapshot.budgetBytes;
+
+  if (availableBytes > kVeryHighDeviceBudgetBytes)
+    return kVeryHighBudgetTileSize;
+  if (availableBytes > kHighDeviceBudgetBytes)
+    return kHighBudgetTileSize;
+  if (availableBytes > kMediumDeviceBudgetBytes)
+    return kMediumBudgetTileSize;
+  if (availableBytes > kLowDeviceBudgetBytes)
+    return kLowBudgetTileSize;
+  if (availableBytes > kVeryLowDeviceBudgetBytes)
+    return kVeryLowBudgetTileSize;
+  return kMinimumBudgetTileSize;
+}
+
+RealESRGAN::DeviceMemorySnapshot
+RealESRGAN::getDeviceMemorySnapshot() const {
+  DeviceMemorySnapshot snapshot;
+  const ncnn::VulkanDevice *device = net.vulkan_device();
+  if (!device) {
+    return snapshot;
+  }
+
+  const ncnn::GpuInfo &info = device->info;
+  snapshot.sharesSystemMemory =
+      info.type() == kIntegratedGpuType || info.type() == kCpuDeviceType;
+  const VkPhysicalDeviceMemoryProperties &memoryProperties =
+      info.physical_device_memory_properties();
+
+  uint32_t deviceLocalHeapIndex = memoryProperties.memoryHeapCount;
+  for (uint32_t index = 0; index < memoryProperties.memoryHeapCount; ++index) {
+    if (memoryProperties.memoryHeaps[index].flags &
+        VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+      deviceLocalHeapIndex = index;
+      break;
+    }
+  }
+
+  if (deviceLocalHeapIndex >= memoryProperties.memoryHeapCount) {
+    return snapshot;
+  }
+
+  const uint64_t heapSizeBytes =
+      memoryProperties.memoryHeaps[deviceLocalHeapIndex].size;
+  if (!info.support_VK_EXT_memory_budget() ||
+      !ncnn::vkGetPhysicalDeviceMemoryProperties2KHR) {
+    snapshot.budgetBytes =
+        heapSizeBytes >= kLargeDeviceHeapThresholdBytes
+            ? heapSizeBytes -
+                  (heapSizeBytes / kLargeHeapReserveDenominator) *
+                      kLargeHeapReservedParts
+            : heapSizeBytes / kSmallHeapBudgetDivisor;
+    snapshot.valid = snapshot.budgetBytes > 0;
+    return snapshot;
+  }
+
+  VkPhysicalDeviceMemoryBudgetPropertiesEXT budgetProperties = {};
+  budgetProperties.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+
+  VkPhysicalDeviceMemoryProperties2KHR queriedProperties = {};
+  queriedProperties.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2_KHR;
+  queriedProperties.pNext = &budgetProperties;
+
+  ncnn::vkGetPhysicalDeviceMemoryProperties2KHR(info.physical_device(),
+                                                &queriedProperties);
+
+  snapshot.budgetBytes = budgetProperties.heapBudget[deviceLocalHeapIndex];
+  snapshot.usageBytes = budgetProperties.heapUsage[deviceLocalHeapIndex];
+  snapshot.usageKnown = true;
+  snapshot.valid = snapshot.budgetBytes > 0;
+  return snapshot;
+}
+
+RealESRGAN::ResourceEstimate
+RealESRGAN::estimateResources(const ResourceRequest &request) const {
+  ResourceEstimate estimate;
+  if (request.inputWidth <= 0 || request.inputHeight <= 0 || scale <= 0 ||
+      tilesize <= 0 || prepadding < 0) {
+    return estimate;
+  }
+
+  const uint64_t inputWidth = static_cast<uint64_t>(request.inputWidth);
+  const uint64_t inputHeight = static_cast<uint64_t>(request.inputHeight);
+  const uint64_t scaleFactor = static_cast<uint64_t>(scale);
+  const uint64_t tileSize = static_cast<uint64_t>(tilesize);
+  const uint64_t padding = static_cast<uint64_t>(prepadding);
+  const uint64_t transformCount =
+      tta_mode ? kTtaTransformCount : kSingleTransformCount;
+
+  const auto doubledPadding =
+      checkedProduct({padding, kPaddingSideCount});
+  const auto outputWidth = checkedProduct({inputWidth, scaleFactor});
+  const auto outputHeight = checkedProduct({inputHeight, scaleFactor});
+  if (!doubledPadding || !outputWidth || !outputHeight) {
+    return estimate;
+  }
+
+  const auto paddedTileWidth =
+      checkedSum({(std::min)(inputWidth, tileSize), *doubledPadding});
+  const auto paddedTileHeight =
+      checkedSum({(std::min)(inputHeight, tileSize), *doubledPadding});
+  const auto maximumInputStripeHeight =
+      checkedSum({tileSize, *doubledPadding});
+  if (!paddedTileWidth || !paddedTileHeight ||
+      !maximumInputStripeHeight) {
+    return estimate;
+  }
+
+  const uint64_t inputStripeHeight =
+      (std::min)(inputHeight, *maximumInputStripeHeight);
+  const uint64_t activeTileWidth = (std::min)(inputWidth, tileSize);
+  const uint64_t activeTileHeight = (std::min)(inputHeight, tileSize);
+  const auto outputStripeHeight =
+      checkedProduct({activeTileHeight, scaleFactor});
+  const auto paddedOutputTileWidth =
+      checkedProduct({*paddedTileWidth, scaleFactor});
+  const auto paddedOutputTileHeight =
+      checkedProduct({*paddedTileHeight, scaleFactor});
+  const auto activeOutputTileWidth =
+      checkedProduct({activeTileWidth, scaleFactor});
+  const auto activeOutputTileHeight =
+      checkedProduct({activeTileHeight, scaleFactor});
+  if (!outputStripeHeight || !paddedOutputTileWidth ||
+      !paddedOutputTileHeight || !activeOutputTileWidth ||
+      !activeOutputTileHeight) {
+    return estimate;
+  }
+
+  const auto inputHostBytes =
+      checkedProduct({inputWidth, inputStripeHeight, kRgbaChannelCount,
+                      kFp32BytesPerChannel});
+  const auto outputHostBytes =
+      checkedProduct({*outputWidth, *outputStripeHeight, kRgbaChannelCount,
+                      kFp32BytesPerChannel});
+  if (!inputHostBytes || !outputHostBytes) {
+    return estimate;
+  }
+
+  // CPU Mats and mapped Vulkan staging buffers coexist at peak.
+  const auto cpuWorkingBytes =
+      checkedSum({*inputHostBytes, *outputHostBytes, *inputHostBytes,
+                  *outputHostBytes});
+
+  const auto inputTileBytes =
+      checkedProduct({*paddedTileWidth, *paddedTileHeight, kRgbChannelCount,
+                      kFp16BytesPerChannel, transformCount});
+  const auto inputAlphaTileBytes =
+      checkedProduct({activeTileWidth, activeTileHeight,
+                      kFp16BytesPerChannel});
+  const auto outputTileBytes =
+      checkedProduct({*paddedOutputTileWidth, *paddedOutputTileHeight,
+                      kRgbChannelCount, kFp16BytesPerChannel,
+                      transformCount});
+  const auto outputAlphaTileBytes =
+      checkedProduct({*activeOutputTileWidth, *activeOutputTileHeight,
+                      kFp16BytesPerChannel});
+  const auto networkWorkspaceBytes =
+      checkedProduct({*paddedOutputTileWidth, *paddedOutputTileHeight,
+                      kNetworkWorkspaceBytesPerOutputPixel});
+  std::optional<uint64_t> deviceWorkingBytes;
+  if (inputTileBytes && inputAlphaTileBytes && outputTileBytes &&
+      outputAlphaTileBytes && networkWorkspaceBytes) {
+    deviceWorkingBytes =
+        checkedSum({*inputHostBytes, *outputHostBytes, *inputTileBytes,
+                    *inputAlphaTileBytes, *outputTileBytes,
+                    *outputAlphaTileBytes, *networkWorkspaceBytes});
+  }
+
+  if (!cpuWorkingBytes || !deviceWorkingBytes) {
+    return estimate;
+  }
+
+  estimate.cpuWorkingBytes = *cpuWorkingBytes;
+  estimate.deviceWorkingBytes = *deviceWorkingBytes;
+  estimate.valid = true;
+  return estimate;
 }
 
 #if _WIN32
@@ -322,6 +554,29 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
   const int w = inimage.w;
   const int h = inimage.h;
   const int channels = inimage.elempack;
+  std::optional<uint64_t> expectedOutputWidth;
+  std::optional<uint64_t> expectedOutputHeight;
+  if (w > 0 && h > 0 && scale > 0) {
+    expectedOutputWidth =
+        checkedProduct({static_cast<uint64_t>(w),
+                        static_cast<uint64_t>(scale)});
+    expectedOutputHeight =
+        checkedProduct({static_cast<uint64_t>(h),
+                        static_cast<uint64_t>(scale)});
+  }
+  if (!pixeldata || !outimage.data || !expectedOutputWidth ||
+      !expectedOutputHeight ||
+      *expectedOutputWidth != static_cast<uint64_t>(outimage.w) ||
+      *expectedOutputHeight != static_cast<uint64_t>(outimage.h) ||
+      outimage.elempack != channels ||
+      (channels != static_cast<int>(kRgbChannelCount) &&
+       channels != static_cast<int>(kRgbaChannelCount)) ||
+      tilesize <= 0 || prepadding < 0) {
+    return kInvalidProcessInputFailure;
+  }
+  if (!net.vulkan_device()) {
+    return kAllocatorUnavailableFailure;
+  }
 
   const int TILE_SIZE_X = tilesize;
   const int TILE_SIZE_Y = tilesize;
@@ -330,6 +585,15 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
       net.vulkan_device()->acquire_blob_allocator();
   ncnn::VkAllocator *staging_vkallocator =
       net.vulkan_device()->acquire_staging_allocator();
+  if (!blob_vkallocator || !staging_vkallocator) {
+    if (blob_vkallocator) {
+      net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
+    }
+    if (staging_vkallocator) {
+      net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
+    }
+    return kAllocatorUnavailableFailure;
+  }
 
   ncnn::Option opt = net.opt;
   opt.blob_vkallocator = blob_vkallocator;
@@ -735,6 +999,8 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
     }
   }
 
+  blob_vkallocator->clear();
+  staging_vkallocator->clear();
   net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
   net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
 
@@ -747,13 +1013,33 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
 int RealESRGAN::processPixels(const unsigned char *inPixels, int inW, int inH,
                               unsigned char *outPixels, int outW,
                               int outH, const std::atomic<bool> *abortFlag) const {
-  ncnn::Mat inMat(inW, inH, (void *)inPixels, (size_t)4u, 4);
-  ncnn::Mat outMat(outW, outH, (size_t)4u, 4);
+  if (!inPixels || !outPixels || inW <= 0 || inH <= 0 || outW <= 0 ||
+      outH <= 0 || scale <= 0) {
+    return kInvalidProcessInputFailure;
+  }
+
+  const auto expectedOutputWidth =
+      checkedProduct({static_cast<uint64_t>(inW),
+                      static_cast<uint64_t>(scale)});
+  const auto expectedOutputHeight =
+      checkedProduct({static_cast<uint64_t>(inH),
+                      static_cast<uint64_t>(scale)});
+  if (!expectedOutputWidth || !expectedOutputHeight ||
+      *expectedOutputWidth != static_cast<uint64_t>(outW) ||
+      *expectedOutputHeight != static_cast<uint64_t>(outH)) {
+    return kInvalidProcessInputFailure;
+  }
+
+  ncnn::Mat inMat(inW, inH, (void *)inPixels,
+                  static_cast<size_t>(kPackedRgbaBytesPerPixel),
+                  static_cast<int>(kRgbaChannelCount));
+  ncnn::Mat outMat(outW, outH, (void *)outPixels,
+                   static_cast<size_t>(kPackedRgbaBytesPerPixel),
+                   static_cast<int>(kRgbaChannelCount));
 
   int ret = process(inMat, outMat, abortFlag);
   if (ret != 0)
     return ret;
 
-  memcpy(outPixels, outMat.data, (size_t)outW * outH * 4);
   return 0;
 }

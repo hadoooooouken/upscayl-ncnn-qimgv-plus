@@ -15,6 +15,7 @@
 
 #include <string>
 #include <atomic>
+#include <cstdint>
 
 // ncnn
 #include "net.h"
@@ -24,6 +25,28 @@
 class REALESRGAN_API RealESRGAN
 {
 public:
+    struct ResourceRequest final
+    {
+        int inputWidth = 0;
+        int inputHeight = 0;
+    };
+
+    struct ResourceEstimate final
+    {
+        uint64_t cpuWorkingBytes = 0;
+        uint64_t deviceWorkingBytes = 0;
+        bool valid = false;
+    };
+
+    struct DeviceMemorySnapshot final
+    {
+        uint64_t budgetBytes = 0;
+        uint64_t usageBytes = 0;
+        bool usageKnown = false;
+        bool sharesSystemMemory = false;
+        bool valid = false;
+    };
+
     RealESRGAN(int gpuid, bool tta_mode = false);
     ~RealESRGAN();
 
@@ -45,6 +68,11 @@ public:
     // Returns the recommended tilesize based on available GPU VRAM.
     // Must be called after construction (Vulkan is already initialised by then).
     int autoTilesize() const;
+
+    // Conservatively estimates peak transient allocations for one request.
+    // Persistent model allocations are reflected in the current device usage.
+    [[nodiscard]] ResourceEstimate estimateResources(const ResourceRequest &request) const;
+    [[nodiscard]] DeviceMemorySnapshot getDeviceMemorySnapshot() const;
 
 public:
     // realesrgan parameters
