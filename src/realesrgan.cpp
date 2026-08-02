@@ -619,32 +619,32 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
 
     int in_tile_y0 = std::max(yi * TILE_SIZE_Y - prepadding, 0);
     int in_tile_y1 = std::min((yi + 1) * TILE_SIZE_Y + prepadding, h);
+    const size_t inputTileByteOffset =
+        static_cast<size_t>(in_tile_y0) * static_cast<size_t>(w) *
+        static_cast<size_t>(channels);
+    const unsigned char *inputTileData = pixeldata + inputTileByteOffset;
 
     ncnn::Mat in;
     if (opt.use_fp16_storage && opt.use_int8_storage) {
       in = ncnn::Mat(w, (in_tile_y1 - in_tile_y0),
-                     (unsigned char *)pixeldata + in_tile_y0 * w * channels,
-                     (size_t)channels, 1);
+                     const_cast<unsigned char *>(inputTileData),
+                     static_cast<size_t>(channels), 1);
     } else {
       if (channels == 3) {
 #if _WIN32
-        in = ncnn::Mat::from_pixels(pixeldata + in_tile_y0 * w * channels,
-                                    ncnn::Mat::PIXEL_BGR2RGB, w,
+        in = ncnn::Mat::from_pixels(inputTileData, ncnn::Mat::PIXEL_BGR2RGB, w,
                                     (in_tile_y1 - in_tile_y0));
 #else
-        in = ncnn::Mat::from_pixels(pixeldata + in_tile_y0 * w * channels,
-                                    ncnn::Mat::PIXEL_RGB, w,
+        in = ncnn::Mat::from_pixels(inputTileData, ncnn::Mat::PIXEL_RGB, w,
                                     (in_tile_y1 - in_tile_y0));
 #endif
       }
       if (channels == 4) {
 #if _WIN32
-        in = ncnn::Mat::from_pixels(pixeldata + in_tile_y0 * w * channels,
-                                    ncnn::Mat::PIXEL_BGRA2RGBA, w,
+        in = ncnn::Mat::from_pixels(inputTileData, ncnn::Mat::PIXEL_BGRA2RGBA, w,
                                     (in_tile_y1 - in_tile_y0));
 #else
-        in = ncnn::Mat::from_pixels(pixeldata + in_tile_y0 * w * channels,
-                                    ncnn::Mat::PIXEL_RGBA, w,
+        in = ncnn::Mat::from_pixels(inputTileData, ncnn::Mat::PIXEL_RGBA, w,
                                     (in_tile_y1 - in_tile_y0));
 #endif
       }
@@ -960,12 +960,16 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
     // download
     {
       ncnn::Mat out;
+      const size_t outputTileByteOffset =
+          static_cast<size_t>(yi) * static_cast<size_t>(scale) *
+          static_cast<size_t>(TILE_SIZE_Y) * static_cast<size_t>(w) *
+          static_cast<size_t>(scale) * static_cast<size_t>(channels);
+      unsigned char *outputTileData =
+          static_cast<unsigned char *>(outimage.data) + outputTileByteOffset;
 
       if (opt.use_fp16_storage && opt.use_int8_storage) {
-        out = ncnn::Mat(out_gpu.w, out_gpu.h,
-                        (unsigned char *)outimage.data +
-                            yi * scale * TILE_SIZE_Y * w * scale * channels,
-                        (size_t)channels, 1);
+        out = ncnn::Mat(out_gpu.w, out_gpu.h, outputTileData,
+                        static_cast<size_t>(channels), 1);
       }
 
       cmd.record_clone(out_gpu, out, opt);
@@ -975,24 +979,16 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
       if (!(opt.use_fp16_storage && opt.use_int8_storage)) {
         if (channels == 3) {
 #if _WIN32
-          out.to_pixels((unsigned char *)outimage.data +
-                            yi * scale * TILE_SIZE_Y * w * scale * channels,
-                        ncnn::Mat::PIXEL_RGB2BGR);
+          out.to_pixels(outputTileData, ncnn::Mat::PIXEL_RGB2BGR);
 #else
-          out.to_pixels((unsigned char *)outimage.data +
-                            yi * scale * TILE_SIZE_Y * w * scale * channels,
-                        ncnn::Mat::PIXEL_RGB);
+          out.to_pixels(outputTileData, ncnn::Mat::PIXEL_RGB);
 #endif
         }
         if (channels == 4) {
 #if _WIN32
-          out.to_pixels((unsigned char *)outimage.data +
-                            yi * scale * TILE_SIZE_Y * w * scale * channels,
-                        ncnn::Mat::PIXEL_RGBA2BGRA);
+          out.to_pixels(outputTileData, ncnn::Mat::PIXEL_RGBA2BGRA);
 #else
-          out.to_pixels((unsigned char *)outimage.data +
-                            yi * scale * TILE_SIZE_Y * w * scale * channels,
-                        ncnn::Mat::PIXEL_RGBA);
+          out.to_pixels(outputTileData, ncnn::Mat::PIXEL_RGBA);
 #endif
         }
       }
