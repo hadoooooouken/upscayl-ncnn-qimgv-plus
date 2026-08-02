@@ -21,6 +21,16 @@ namespace {
 constexpr int kModelLoadFailure = -1;
 constexpr int kInvalidProcessInputFailure = -2;
 constexpr int kAllocatorUnavailableFailure = -3;
+constexpr int kPipelineCreationFailure = -4;
+constexpr int kInferenceInputFailure = -5;
+constexpr int kInferenceExtractionFailure = -6;
+constexpr int kVulkanSubmissionFailure = -7;
+constexpr int kVulkanResetFailure = -8;
+constexpr int kAlphaUpscaleFailure = -9;
+constexpr int kPipelineLocalSizeWidth = 32;
+constexpr int kPipelineLocalSizeHeight = 32;
+constexpr int kPipelineLocalSizeChannels = 3;
+constexpr int kBicubicInterpolationType = 3;
 constexpr uint64_t kBytesPerMebibyte = 1024ULL * 1024ULL;
 constexpr uint64_t kLargeDeviceHeapThresholdBytes =
     4000ULL * kBytesPerMebibyte;
@@ -85,6 +95,34 @@ checkedSum(std::initializer_list<uint64_t> terms) {
 }
 
 using FileHandle = std::unique_ptr<FILE, decltype(&fclose)>;
+
+class VulkanAllocatorReclaimer final {
+public:
+  enum class Pool {
+    Blob,
+    Staging,
+  };
+
+  VulkanAllocatorReclaimer(const ncnn::VulkanDevice &device,
+                           Pool pool) noexcept
+      : device(device), pool(pool) {}
+
+  void operator()(ncnn::VkAllocator *allocator) const noexcept {
+    allocator->clear();
+    if (pool == Pool::Blob) {
+      device.reclaim_blob_allocator(allocator);
+    } else {
+      device.reclaim_staging_allocator(allocator);
+    }
+  }
+
+private:
+  const ncnn::VulkanDevice &device;
+  Pool pool;
+};
+
+using VulkanAllocatorLease =
+    std::unique_ptr<ncnn::VkAllocator, VulkanAllocatorReclaimer>;
 }
 
 static const uint32_t realesrgan_preproc_spv_data[] = {
@@ -438,6 +476,11 @@ int RealESRGAN::load(const std::string &parampath, const std::string &modelpath)
     return modelResult;
 #endif
 
+  const ncnn::VulkanDevice *vulkanDevice = net.vulkan_device();
+  if (!vulkanDevice) {
+    return kAllocatorUnavailableFailure;
+  }
+
   // initialize preprocess and postprocess pipeline
   {
     std::vector<ncnn::vk_specialization_type> specializations(1);
@@ -447,103 +490,133 @@ int RealESRGAN::load(const std::string &parampath, const std::string &modelpath)
     specializations[0].i = 0;
 #endif
 
-    realesrgan_preproc = new ncnn::Pipeline(net.vulkan_device());
-    realesrgan_preproc->set_optimal_local_size_xyz(32, 32, 3);
+    realesrgan_preproc = new ncnn::Pipeline(vulkanDevice);
+    realesrgan_preproc->set_optimal_local_size_xyz(
+        kPipelineLocalSizeWidth, kPipelineLocalSizeHeight,
+        kPipelineLocalSizeChannels);
 
-    realesrgan_postproc = new ncnn::Pipeline(net.vulkan_device());
-    realesrgan_postproc->set_optimal_local_size_xyz(32, 32, 3);
+    realesrgan_postproc = new ncnn::Pipeline(vulkanDevice);
+    realesrgan_postproc->set_optimal_local_size_xyz(
+        kPipelineLocalSizeWidth, kPipelineLocalSizeHeight,
+        kPipelineLocalSizeChannels);
+
+    int preprocPipelineResult = 0;
+    int postprocPipelineResult = 0;
 
     if (tta_mode) {
       if (net.opt.use_fp16_storage && net.opt.use_int8_storage)
-        realesrgan_preproc->create(
+        preprocPipelineResult = realesrgan_preproc->create(
             realesrgan_preproc_tta_int8s_spv_data,
             sizeof(realesrgan_preproc_tta_int8s_spv_data), specializations);
       else if (net.opt.use_fp16_storage)
-        realesrgan_preproc->create(
+        preprocPipelineResult = realesrgan_preproc->create(
             realesrgan_preproc_tta_fp16s_spv_data,
             sizeof(realesrgan_preproc_tta_fp16s_spv_data), specializations);
       else
-        realesrgan_preproc->create(realesrgan_preproc_tta_spv_data,
-                                   sizeof(realesrgan_preproc_tta_spv_data),
-                                   specializations);
+        preprocPipelineResult = realesrgan_preproc->create(
+            realesrgan_preproc_tta_spv_data,
+            sizeof(realesrgan_preproc_tta_spv_data), specializations);
+
+      if (preprocPipelineResult != 0) {
+        fprintf(stderr, "NCNN preprocessing pipeline creation failed: %d\n",
+                preprocPipelineResult);
+        return kPipelineCreationFailure;
+      }
 
       if (net.opt.use_fp16_storage && net.opt.use_int8_storage)
-        realesrgan_postproc->create(
+        postprocPipelineResult = realesrgan_postproc->create(
             realesrgan_postproc_tta_int8s_spv_data,
             sizeof(realesrgan_postproc_tta_int8s_spv_data), specializations);
       else if (net.opt.use_fp16_storage)
-        realesrgan_postproc->create(
+        postprocPipelineResult = realesrgan_postproc->create(
             realesrgan_postproc_tta_fp16s_spv_data,
             sizeof(realesrgan_postproc_tta_fp16s_spv_data), specializations);
       else
-        realesrgan_postproc->create(realesrgan_postproc_tta_spv_data,
-                                    sizeof(realesrgan_postproc_tta_spv_data),
-                                    specializations);
+        postprocPipelineResult = realesrgan_postproc->create(
+            realesrgan_postproc_tta_spv_data,
+            sizeof(realesrgan_postproc_tta_spv_data), specializations);
     } else {
       if (net.opt.use_fp16_storage && net.opt.use_int8_storage)
-        realesrgan_preproc->create(realesrgan_preproc_int8s_spv_data,
-                                   sizeof(realesrgan_preproc_int8s_spv_data),
-                                   specializations);
+        preprocPipelineResult = realesrgan_preproc->create(
+            realesrgan_preproc_int8s_spv_data,
+            sizeof(realesrgan_preproc_int8s_spv_data), specializations);
       else if (net.opt.use_fp16_storage)
-        realesrgan_preproc->create(realesrgan_preproc_fp16s_spv_data,
-                                   sizeof(realesrgan_preproc_fp16s_spv_data),
-                                   specializations);
+        preprocPipelineResult = realesrgan_preproc->create(
+            realesrgan_preproc_fp16s_spv_data,
+            sizeof(realesrgan_preproc_fp16s_spv_data), specializations);
       else
-        realesrgan_preproc->create(realesrgan_preproc_spv_data,
-                                   sizeof(realesrgan_preproc_spv_data),
-                                   specializations);
+        preprocPipelineResult = realesrgan_preproc->create(
+            realesrgan_preproc_spv_data,
+            sizeof(realesrgan_preproc_spv_data), specializations);
+
+      if (preprocPipelineResult != 0) {
+        fprintf(stderr, "NCNN preprocessing pipeline creation failed: %d\n",
+                preprocPipelineResult);
+        return kPipelineCreationFailure;
+      }
 
       if (net.opt.use_fp16_storage && net.opt.use_int8_storage)
-        realesrgan_postproc->create(realesrgan_postproc_int8s_spv_data,
-                                    sizeof(realesrgan_postproc_int8s_spv_data),
-                                    specializations);
+        postprocPipelineResult = realesrgan_postproc->create(
+            realesrgan_postproc_int8s_spv_data,
+            sizeof(realesrgan_postproc_int8s_spv_data), specializations);
       else if (net.opt.use_fp16_storage)
-        realesrgan_postproc->create(realesrgan_postproc_fp16s_spv_data,
-                                    sizeof(realesrgan_postproc_fp16s_spv_data),
-                                    specializations);
+        postprocPipelineResult = realesrgan_postproc->create(
+            realesrgan_postproc_fp16s_spv_data,
+            sizeof(realesrgan_postproc_fp16s_spv_data), specializations);
       else
-        realesrgan_postproc->create(realesrgan_postproc_spv_data,
-                                    sizeof(realesrgan_postproc_spv_data),
-                                    specializations);
+        postprocPipelineResult = realesrgan_postproc->create(
+            realesrgan_postproc_spv_data,
+            sizeof(realesrgan_postproc_spv_data), specializations);
+    }
+
+    if (postprocPipelineResult != 0) {
+      fprintf(stderr, "NCNN postprocessing pipeline creation failed: %d\n",
+              postprocPipelineResult);
+      return kPipelineCreationFailure;
     }
   }
 
   // bicubic 2x/3x/4x for alpha channel
-  {
-    bicubic_2x = ncnn::create_layer("Interp");
-    bicubic_2x->vkdev = net.vulkan_device();
+  const auto createBicubicPipeline =
+      [this, vulkanDevice](ncnn::Layer *&layer, float scaleFactor) {
+    layer = ncnn::create_layer("Interp");
+    if (!layer) {
+      fprintf(stderr, "NCNN bicubic layer creation failed\n");
+      return kPipelineCreationFailure;
+    }
+    layer->vkdev = vulkanDevice;
 
     ncnn::ParamDict pd;
-    pd.set(0, 3); // bicubic
-    pd.set(1, 2.f);
-    pd.set(2, 2.f);
-    bicubic_2x->load_param(pd);
+    pd.set(0, kBicubicInterpolationType);
+    pd.set(1, scaleFactor);
+    pd.set(2, scaleFactor);
+    const int parameterResult = layer->load_param(pd);
+    if (parameterResult != 0) {
+      fprintf(stderr, "NCNN bicubic layer setup failed: %d\n",
+              parameterResult);
+      return kPipelineCreationFailure;
+    }
 
-    bicubic_2x->create_pipeline(net.opt);
+    const int pipelineResult = layer->create_pipeline(net.opt);
+    if (pipelineResult != 0) {
+      fprintf(stderr, "NCNN bicubic pipeline creation failed: %d\n",
+              pipelineResult);
+      return kPipelineCreationFailure;
+    }
+    return 0;
+  };
+
+  const int bicubic2xResult = createBicubicPipeline(bicubic_2x, 2.f);
+  if (bicubic2xResult != 0) {
+    return bicubic2xResult;
   }
-  {
-    bicubic_3x = ncnn::create_layer("Interp");
-    bicubic_3x->vkdev = net.vulkan_device();
-
-    ncnn::ParamDict pd;
-    pd.set(0, 3); // bicubic
-    pd.set(1, 3.f);
-    pd.set(2, 3.f);
-    bicubic_3x->load_param(pd);
-
-    bicubic_3x->create_pipeline(net.opt);
+  const int bicubic3xResult = createBicubicPipeline(bicubic_3x, 3.f);
+  if (bicubic3xResult != 0) {
+    return bicubic3xResult;
   }
-  {
-    bicubic_4x = ncnn::create_layer("Interp");
-    bicubic_4x->vkdev = net.vulkan_device();
-
-    ncnn::ParamDict pd;
-    pd.set(0, 3); // bicubic
-    pd.set(1, 4.f);
-    pd.set(2, 4.f);
-    bicubic_4x->load_param(pd);
-
-    bicubic_4x->create_pipeline(net.opt);
+  const int bicubic4xResult = createBicubicPipeline(bicubic_4x, 4.f);
+  if (bicubic4xResult != 0) {
+    return bicubic4xResult;
   }
 
   return 0;
@@ -574,24 +647,26 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
       tilesize <= 0 || prepadding < 0) {
     return kInvalidProcessInputFailure;
   }
-  if (!net.vulkan_device()) {
+  const ncnn::VulkanDevice *vulkanDevice = net.vulkan_device();
+  if (!vulkanDevice) {
     return kAllocatorUnavailableFailure;
   }
 
   const int TILE_SIZE_X = tilesize;
   const int TILE_SIZE_Y = tilesize;
 
-  ncnn::VkAllocator *blob_vkallocator =
-      net.vulkan_device()->acquire_blob_allocator();
-  ncnn::VkAllocator *staging_vkallocator =
-      net.vulkan_device()->acquire_staging_allocator();
+  VulkanAllocatorLease blobAllocatorLease(
+      vulkanDevice->acquire_blob_allocator(),
+      VulkanAllocatorReclaimer(*vulkanDevice,
+                               VulkanAllocatorReclaimer::Pool::Blob));
+  VulkanAllocatorLease stagingAllocatorLease(
+      vulkanDevice->acquire_staging_allocator(),
+      VulkanAllocatorReclaimer(*vulkanDevice,
+                               VulkanAllocatorReclaimer::Pool::Staging));
+  ncnn::VkAllocator *const blob_vkallocator = blobAllocatorLease.get();
+  ncnn::VkAllocator *const staging_vkallocator =
+      stagingAllocatorLease.get();
   if (!blob_vkallocator || !staging_vkallocator) {
-    if (blob_vkallocator) {
-      net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
-    }
-    if (staging_vkallocator) {
-      net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
-    }
     return kAllocatorUnavailableFailure;
   }
 
@@ -650,7 +725,7 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
       }
     }
 
-    ncnn::VkCompute cmd(net.vulkan_device());
+    ncnn::VkCompute cmd(vulkanDevice);
 
     // upload
     ncnn::VkMat in_gpu;
@@ -658,8 +733,18 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
       cmd.record_clone(in, in_gpu, opt);
 
       if (xtiles > 1) {
-        cmd.submit_and_wait();
-        cmd.reset();
+        const int submissionResult = cmd.submit_and_wait();
+        if (submissionResult != 0) {
+          fprintf(stderr, "Vulkan upload submission failed: %d\n",
+                  submissionResult);
+          return kVulkanSubmissionFailure;
+        }
+        const int resetResult = cmd.reset();
+        if (resetResult != 0) {
+          fprintf(stderr, "Vulkan command reset failed after upload: %d\n",
+                  resetResult);
+          return kVulkanResetFailure;
+        }
       }
     }
 
@@ -761,13 +846,34 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
           ex.set_workspace_vkallocator(blob_vkallocator);
           ex.set_staging_vkallocator(staging_vkallocator);
 
-          ex.input("data", in_tile_gpu[ti]);
+          const int inputResult = ex.input("data", in_tile_gpu[ti]);
+          if (inputResult != 0) {
+            fprintf(stderr, "NCNN extractor input failed: %d\n", inputResult);
+            return kInferenceInputFailure;
+          }
 
-          ex.extract("output", out_tile_gpu[ti], cmd);
+          const int extractionResult =
+              ex.extract("output", out_tile_gpu[ti], cmd);
+          if (extractionResult != 0) {
+            fprintf(stderr, "NCNN extractor output failed: %d\n",
+                    extractionResult);
+            return kInferenceExtractionFailure;
+          }
 
           {
-            cmd.submit_and_wait();
-            cmd.reset();
+            const int submissionResult = cmd.submit_and_wait();
+            if (submissionResult != 0) {
+              fprintf(stderr, "Vulkan inference submission failed: %d\n",
+                      submissionResult);
+              return kVulkanSubmissionFailure;
+            }
+            const int resetResult = cmd.reset();
+            if (resetResult != 0) {
+              fprintf(stderr,
+                      "Vulkan command reset failed after inference: %d\n",
+                      resetResult);
+              return kVulkanResetFailure;
+            }
           }
         }
 
@@ -777,16 +883,31 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
             out_alpha_tile_gpu = in_alpha_tile_gpu;
           }
           if (scale == 2) {
-            bicubic_2x->forward(in_alpha_tile_gpu, out_alpha_tile_gpu, cmd,
-                                opt);
+            const int alphaResult = bicubic_2x->forward(
+                in_alpha_tile_gpu, out_alpha_tile_gpu, cmd, opt);
+            if (alphaResult != 0) {
+              fprintf(stderr, "NCNN 2x alpha upscale failed: %d\n",
+                      alphaResult);
+              return kAlphaUpscaleFailure;
+            }
           }
           if (scale == 3) {
-            bicubic_3x->forward(in_alpha_tile_gpu, out_alpha_tile_gpu, cmd,
-                                opt);
+            const int alphaResult = bicubic_3x->forward(
+                in_alpha_tile_gpu, out_alpha_tile_gpu, cmd, opt);
+            if (alphaResult != 0) {
+              fprintf(stderr, "NCNN 3x alpha upscale failed: %d\n",
+                      alphaResult);
+              return kAlphaUpscaleFailure;
+            }
           }
           if (scale == 4) {
-            bicubic_4x->forward(in_alpha_tile_gpu, out_alpha_tile_gpu, cmd,
-                                opt);
+            const int alphaResult = bicubic_4x->forward(
+                in_alpha_tile_gpu, out_alpha_tile_gpu, cmd, opt);
+            if (alphaResult != 0) {
+              fprintf(stderr, "NCNN 4x alpha upscale failed: %d\n",
+                      alphaResult);
+              return kAlphaUpscaleFailure;
+            }
           }
         }
 
@@ -886,9 +1007,19 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
           ex.set_workspace_vkallocator(blob_vkallocator);
           ex.set_staging_vkallocator(staging_vkallocator);
 
-          ex.input("data", in_tile_gpu);
+          const int inputResult = ex.input("data", in_tile_gpu);
+          if (inputResult != 0) {
+            fprintf(stderr, "NCNN extractor input failed: %d\n", inputResult);
+            return kInferenceInputFailure;
+          }
 
-          ex.extract("output", out_tile_gpu, cmd);
+          const int extractionResult =
+              ex.extract("output", out_tile_gpu, cmd);
+          if (extractionResult != 0) {
+            fprintf(stderr, "NCNN extractor output failed: %d\n",
+                    extractionResult);
+            return kInferenceExtractionFailure;
+          }
         }
 
         ncnn::VkMat out_alpha_tile_gpu;
@@ -897,16 +1028,31 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
             out_alpha_tile_gpu = in_alpha_tile_gpu;
           }
           if (scale == 2) {
-            bicubic_2x->forward(in_alpha_tile_gpu, out_alpha_tile_gpu, cmd,
-                                opt);
+            const int alphaResult = bicubic_2x->forward(
+                in_alpha_tile_gpu, out_alpha_tile_gpu, cmd, opt);
+            if (alphaResult != 0) {
+              fprintf(stderr, "NCNN 2x alpha upscale failed: %d\n",
+                      alphaResult);
+              return kAlphaUpscaleFailure;
+            }
           }
           if (scale == 3) {
-            bicubic_3x->forward(in_alpha_tile_gpu, out_alpha_tile_gpu, cmd,
-                                opt);
+            const int alphaResult = bicubic_3x->forward(
+                in_alpha_tile_gpu, out_alpha_tile_gpu, cmd, opt);
+            if (alphaResult != 0) {
+              fprintf(stderr, "NCNN 3x alpha upscale failed: %d\n",
+                      alphaResult);
+              return kAlphaUpscaleFailure;
+            }
           }
           if (scale == 4) {
-            bicubic_4x->forward(in_alpha_tile_gpu, out_alpha_tile_gpu, cmd,
-                                opt);
+            const int alphaResult = bicubic_4x->forward(
+                in_alpha_tile_gpu, out_alpha_tile_gpu, cmd, opt);
+            if (alphaResult != 0) {
+              fprintf(stderr, "NCNN 4x alpha upscale failed: %d\n",
+                      alphaResult);
+              return kAlphaUpscaleFailure;
+            }
           }
         }
 
@@ -945,8 +1091,18 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
       }
 
       if (xtiles > 1) {
-        cmd.submit_and_wait();
-        cmd.reset();
+        const int submissionResult = cmd.submit_and_wait();
+        if (submissionResult != 0) {
+          fprintf(stderr, "Vulkan tile submission failed: %d\n",
+                  submissionResult);
+          return kVulkanSubmissionFailure;
+        }
+        const int resetResult = cmd.reset();
+        if (resetResult != 0) {
+          fprintf(stderr, "Vulkan command reset failed after tile: %d\n",
+                  resetResult);
+          return kVulkanResetFailure;
+        }
       }
 
       fprintf(stderr, "%.2f%%\n",
@@ -974,7 +1130,12 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
 
       cmd.record_clone(out_gpu, out, opt);
 
-      cmd.submit_and_wait();
+      const int submissionResult = cmd.submit_and_wait();
+      if (submissionResult != 0) {
+        fprintf(stderr, "Vulkan download submission failed: %d\n",
+                submissionResult);
+        return kVulkanSubmissionFailure;
+      }
 
       if (!(opt.use_fp16_storage && opt.use_int8_storage)) {
         if (channels == 3) {
@@ -994,11 +1155,6 @@ int RealESRGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage, const std
       }
     }
   }
-
-  blob_vkallocator->clear();
-  staging_vkallocator->clear();
-  net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
-  net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
 
   if (aborted) {
     return -1;
