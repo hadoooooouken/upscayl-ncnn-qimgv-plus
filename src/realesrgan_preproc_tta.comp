@@ -51,6 +51,20 @@ layout (push_constant) uniform parameter
     int alphah;
 } p;
 
+int reflect101Coordinate(int coordinate, int size)
+{
+    if (size <= 1)
+        return 0;
+
+    const int period = 2 * (size - 1);
+    int reflected = coordinate % period;
+
+    if (reflected < 0)
+        reflected += period;
+
+    return reflected < size ? reflected : period - reflected;
+}
+
 void main()
 {
     int gx = int(gl_GlobalInvocationID.x);
@@ -63,10 +77,8 @@ void main()
     int x = gx + p.crop_x - p.pad_left;
     int y = gy + p.crop_y - p.pad_top;
 
-    x = abs(x);
-    y = abs(y);
-    x = (p.w - 1) - abs(x - (p.w - 1));
-    y = (p.h - 1) - abs(y - (p.h - 1));
+    x = reflect101Coordinate(x, p.w);
+    y = reflect101Coordinate(y, p.h);
 
 #if NCNN_int8_storage
     int v_offset = y * p.w + x;
