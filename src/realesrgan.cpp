@@ -327,6 +327,18 @@ RealESRGAN::getDeviceMemorySnapshot() const {
   return snapshot;
 }
 
+bool RealESRGAN::isDeviceLossError(int errorCode) noexcept {
+  // kVulkanSubmissionFailure / kVulkanResetFailure are returned only by
+  // failed ncnn::VkCompute::submit_and_wait() / cmd.reset() calls inside
+  // process()'s per-tile loop, which is the reliable signature of the
+  // Vulkan device having been reset out from under this process (e.g. by
+  // a Windows TDR event). Every other negative code here reflects a
+  // model-load, allocator, or input-validation failure that a rebuild
+  // will not fix.
+  return errorCode == kVulkanSubmissionFailure ||
+         errorCode == kVulkanResetFailure;
+}
+
 RealESRGAN::ResourceEstimate
 RealESRGAN::estimateResources(const ResourceRequest &request) const {
   ResourceEstimate estimate;

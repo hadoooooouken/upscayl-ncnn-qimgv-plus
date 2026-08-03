@@ -74,6 +74,13 @@ public:
     [[nodiscard]] ResourceEstimate estimateResources(const ResourceRequest &request) const;
     [[nodiscard]] DeviceMemorySnapshot getDeviceMemorySnapshot() const;
 
+    // Classifies an error code returned by process()/processPixels() as a
+    // Vulkan device-loss failure (e.g. after a Windows TDR driver reset),
+    // as opposed to a model-load, allocation, or input-validation failure.
+    // Callers can use this to decide whether rebuilding this RealESRGAN
+    // instance and retrying is worthwhile.
+    [[nodiscard]] static bool isDeviceLossError(int errorCode) noexcept;
+
 public:
     // realesrgan parameters
     int scale;
