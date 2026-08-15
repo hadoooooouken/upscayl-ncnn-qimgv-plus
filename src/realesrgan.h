@@ -16,7 +16,6 @@
 #include <string>
 #include <atomic>
 #include <cstdint>
-#include <optional>
 
 // ncnn
 #include "net.h"
@@ -82,13 +81,6 @@ public:
     // instance and retrying is worthwhile.
     [[nodiscard]] static bool isDeviceLossError(int errorCode) noexcept;
 
-    // Scale factor derived from the loaded model's own graph (via PixelShuffle
-    // upscale_factor along the path to the declared output blob). Populated by
-    // load() on success; nullopt if the graph could not be walked to a
-    // confident answer (e.g. no PixelShuffle on any path to output). Callers
-    // should fall back to their own default when this is nullopt.
-    [[nodiscard]] std::optional<int> detectedScale() const noexcept { return cachedDetectedScale; }
-
 public:
     // realesrgan parameters
     int scale;
@@ -96,8 +88,6 @@ public:
     int prepadding;
 
 private:
-    [[nodiscard]] std::optional<int> detectScaleFromGraph() const;
-
     ncnn::Net net;
     ncnn::Pipeline *realesrgan_preproc;
     ncnn::Pipeline *realesrgan_postproc;
@@ -105,7 +95,6 @@ private:
     ncnn::Layer *bicubic_3x;
     ncnn::Layer *bicubic_4x;
     bool tta_mode;
-    std::optional<int> cachedDetectedScale;
 };
 
 #endif // REALESRGAN_H
