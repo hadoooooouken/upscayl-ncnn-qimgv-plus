@@ -7,7 +7,11 @@
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <string_view>
 #include <vector>
+
+// ncnn
+#include "layer/pixelshuffle.h"
 
 
 #if _WIN32
@@ -62,12 +66,50 @@ constexpr uint64_t kLargeHeapReservedParts = 3;
 constexpr uint64_t kSmallHeapBudgetDivisor = 2;
 constexpr uint64_t kWorkspaceConcurrentFeatureMapCount = 4;
 constexpr uint64_t kWorkspaceFeatureChannelCount = 64;
+constexpr std::string_view kPixelShuffleLayerType = "PixelShuffle";
+// 1 == "no PixelShuffle found on any path to output" (identity/no-op scale).
+constexpr int kNoScaleDetected = 1;
 
 // Reserve four simultaneous 64-channel fp16 feature maps at the output-tile
 // resolution. Known input/output and staging buffers are added separately.
 constexpr uint64_t kNetworkWorkspaceBytesPerOutputPixel =
     kWorkspaceConcurrentFeatureMapCount * kWorkspaceFeatureChannelCount *
     kFp16BytesPerChannel;
+
+// Walks the ncnn graph backwards from `blobIndex` toward the network's
+// inputs, following every `bottoms` entry on branching layers, and returns
+// the product of every PixelShuffle::upscale_factor encountered along the
+// best (max) path. Returns kNoScaleDetected (1) if no PixelShuffle lies on
+// any path from `blobIndex` back to an input.
+int walkForScale(const ncnn::Net &net, int blobIndex, std::vector<bool> &visited) {
+  if (blobIndex < 0 || blobIndex >= static_cast<int>(visited.size()) ||
+      visited[blobIndex]) {
+    return kNoScaleDetected;
+  }
+  visited[blobIndex] = true;
+
+  const int layerIndex = net.blobs()[blobIndex].producer;
+  if (layerIndex < 0) {
+    return kNoScaleDetected;
+  }
+
+  const ncnn::Layer *layer = net.layers()[layerIndex];
+  const int localFactor =
+      (layer->type == kPixelShuffleLayerType)
+          ? static_cast<const ncnn::PixelShuffle *>(layer)->upscale_factor
+          : kNoScaleDetected;
+
+  if (layer->bottoms.empty()) {
+    return localFactor;
+  }
+
+  int best = kNoScaleDetected;
+  for (const int bottomBlobIndex : layer->bottoms) {
+    best = (std::max)(best, walkForScale(net, bottomBlobIndex, visited));
+  }
+
+  return localFactor * best;
+}
 
 std::optional<uint64_t>
 checkedProduct(std::initializer_list<uint64_t> factors) {
@@ -444,6 +486,29 @@ RealESRGAN::estimateResources(const ResourceRequest &request) const {
   return estimate;
 }
 
+std::optional<int> RealESRGAN::detectScaleFromGraph() const {
+  const std::vector<const char *> &outputNames = net.output_names();
+  if (outputNames.empty()) {
+    return std::nullopt;
+  }
+
+  const std::vector<ncnn::Blob> &blobs = net.blobs();
+  int outputBlobIndex = -1;
+  for (size_t i = 0; i < blobs.size(); ++i) {
+    if (blobs[i].name == outputNames[0]) {
+      outputBlobIndex = static_cast<int>(i);
+      break;
+    }
+  }
+  if (outputBlobIndex < 0) {
+    return std::nullopt;
+  }
+
+  std::vector<bool> visited(blobs.size(), false);
+  const int best = walkForScale(net, outputBlobIndex, visited);
+  return best > kNoScaleDetected ? std::make_optional(best) : std::nullopt;
+}
+
 #if _WIN32
 int RealESRGAN::load(const std::wstring &parampath,
                      const std::wstring &modelpath)
@@ -630,6 +695,8 @@ int RealESRGAN::load(const std::string &parampath, const std::string &modelpath)
   if (bicubic4xResult != 0) {
     return bicubic4xResult;
   }
+
+  cachedDetectedScale = detectScaleFromGraph();
 
   return 0;
 }
