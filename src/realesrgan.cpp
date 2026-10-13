@@ -54,6 +54,10 @@ constexpr uint64_t kRgbChannelCount = 3;
 constexpr uint64_t kPackedRgbaBytesPerPixel = 4;
 constexpr uint64_t kFp16BytesPerChannel = sizeof(uint16_t);
 constexpr uint64_t kFp32BytesPerChannel = sizeof(float);
+constexpr uint64_t kInt8BytesPerChannel = sizeof(uint8_t);
+// Host copies of a tile stripe: staging only, or staging and an fp32 Mat.
+constexpr uint64_t kPackedHostStripeCopies = 1;
+constexpr uint64_t kFp32HostStripeCopies = 2;
 constexpr uint64_t kTtaTransformCount = 8;
 constexpr uint64_t kSingleTransformCount = 1;
 constexpr uint64_t kPaddingSideCount = 2;
@@ -200,7 +204,11 @@ RealESRGAN::RealESRGAN(int gpuid, bool _tta_mode) {
   net.opt.use_fp16_packed = true;
   net.opt.use_fp16_storage = true;
   net.opt.use_fp16_arithmetic = false;
-  net.opt.use_int8_storage = false;
+  // Packed 8-bit tile input and output: the pre- and postprocess shaders read
+  // and write the caller's BGRA bytes directly, instead of a 4x larger fp32
+  // planar readback unpacked on the CPU. Net::load_param() turns it off on
+  // devices without 8-bit storage before the pipelines are created.
+  net.opt.use_int8_storage = true;
   net.opt.use_int8_arithmetic = false;
 
   net.set_vulkan_device(gpuid);
@@ -394,20 +402,31 @@ RealESRGAN::estimateResources(const ResourceRequest &request) const {
     return estimate;
   }
 
+  // Packed 8-bit stripes alias the caller's pixel buffers; otherwise
+  // process() converts each stripe to and from an fp32 planar Mat.
+  const bool packedStripes = net.opt.use_fp16_storage && net.opt.use_int8_storage;
+  const uint64_t stripeBytesPerChannel =
+      packedStripes ? kInt8BytesPerChannel : kFp32BytesPerChannel;
   const auto inputHostBytes =
       checkedProduct({inputWidth, inputStripeHeight, kRgbaChannelCount,
-                      kFp32BytesPerChannel});
+                      stripeBytesPerChannel});
   const auto outputHostBytes =
       checkedProduct({*outputWidth, *outputStripeHeight, kRgbaChannelCount,
-                      kFp32BytesPerChannel});
+                      stripeBytesPerChannel});
   if (!inputHostBytes || !outputHostBytes) {
     return estimate;
   }
 
-  // CPU Mats and mapped Vulkan staging buffers coexist at peak.
+  // The mapped Vulkan staging buffers, plus the fp32 CPU Mats that coexist
+  // with them at peak when the stripes are not packed.
+  const uint64_t hostStripeCopies =
+      packedStripes ? kPackedHostStripeCopies : kFp32HostStripeCopies;
+  const auto stripePairBytes = checkedSum({*inputHostBytes, *outputHostBytes});
+  if (!stripePairBytes) {
+    return estimate;
+  }
   const auto cpuWorkingBytes =
-      checkedSum({*inputHostBytes, *outputHostBytes, *inputHostBytes,
-                  *outputHostBytes});
+      checkedProduct({*stripePairBytes, hostStripeCopies});
 
   const auto inputTileBytes =
       checkedProduct({*paddedTileWidth, *paddedTileHeight, kRgbChannelCount,
